@@ -11,7 +11,6 @@ app = FastAPI()
 
 AIPIPE_BASE = os.environ.get("AIPIPE_BASE", "https://aipipe.org/openai/v1")
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
 
 
@@ -26,15 +25,38 @@ async def chat(messages, model="gpt-4o", max_tokens=1000):
 
 
 async def gemini_transcribe(payload, retries=3):
+    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=60) as client:
         for model in GEMINI_MODELS:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            request_payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
+                        payload["contents"][0]["parts"][1],
+                    ],
+                }],
+                "max_tokens": 1000,
+            }
             for attempt in range(retries):
                 try:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(f"{AIPIPE_BASE}/chat/completions", headers=headers, json=request_payload)
                     if resp.status_code == 200:
                         data = resp.json()
-                        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        choices = data.get("choices", [])
+                        if choices:
+                            message = choices[0].get("message", {})
+                            content = message.get("content", "")
+                            if isinstance(content, str):
+                                return content.strip()
+                            if isinstance(content, list):
+                                parts = []
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("text"):
+                                        parts.append(part["text"])
+                                return "".join(parts).strip()
+                        return ""
                     elif resp.status_code in (429, 503):
                         await asyncio.sleep(2 ** attempt)
                         continue
