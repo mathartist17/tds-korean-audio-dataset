@@ -312,16 +312,35 @@ async def answer_audio(request: Request):
         if not tr:
             return found
 
+        stat_words = (
+            "평균", "중앙값", "중간값", "최빈값", "분산", "표준편차", "최솟값", "최댓값",
+            "최소", "최대", "범위", "상관관계", "허용값", "허용된 값", "사이", "부터",
+            "까지", "이상", "이하",
+        )
         patterns = [
-            r"([가-힣A-Za-z0-9_]+?)(?:는|은|이|가)(?=\s*(?:평균|중앙값|중간값|최빈값|분산|표준편차|최솟값|최댓값|최소|최대|범위|상관관계|허용값|허용된 값|사이|부터|까지|이상|이하))",
-            r"([가-힣A-Za-z0-9_]+?)의(?=\s*(?:평균|중앙값|중간값|최빈값|분산|표준편차|최솟값|최댓값|최소|최대|범위|상관관계|허용값|허용된 값|사이))",
-            r"(?:평균|중앙값|중간값|최빈값|분산|표준편차|최솟값|최댓값|최소|최대|범위)\s*(?:은|는|이|가)?\s*([가-힣A-Za-z0-9_]+)",
+            rf"([가-힣A-Za-z0-9_]+?)\s*(?:의\s*)?(?:{'|'.join(stat_words)})",
+            rf"([가-힣A-Za-z0-9_]+?)(?:는|은|이|가)(?=\s*(?:{'|'.join(stat_words)}))",
+            rf"(?:{'|'.join(stat_words)})\s*(?:은|는|이|가)?\s*([가-힣A-Za-z0-9_]+)",
         ]
         for pattern in patterns:
             for match in re.finditer(pattern, tr):
                 col = match.group(1).strip()
                 if col and col not in found:
                     found.append(col)
+
+        if not found:
+            tokens = re.findall(r"[가-힣A-Za-z0-9_]+", tr)
+            stopwords = set(stat_words) | {
+                "데이터", "자료", "표", "행", "열", "값", "구하라", "구하세요", "계산", "출력",
+                "다음", "문항", "문제", "모두", "각각", "사람", "학생", "점수", "소득",
+                "몸무게", "키", "나이",
+            }
+            candidates = []
+            for token in tokens:
+                if len(token) > 1 and not token.isdigit() and token not in stopwords and token not in candidates:
+                    candidates.append(token)
+            if len(candidates) == 1:
+                found.append(candidates[0])
         return found
 
     transcript_columns = _extract_columns_from_transcript(transcript)
