@@ -307,6 +307,28 @@ async def answer_audio(request: Request):
                  "range", "allowed_values", "value_range", "correlation"]):
             req_stats.append("allowed_values")
 
+    def _extract_columns_from_transcript(tr):
+        found = []
+        if not tr:
+            return found
+
+        patterns = [
+            r"([가-힣A-Za-z0-9_]+?)(?:는|은|이|가)(?=\s*(?:평균|중앙값|중간값|최빈값|분산|표준편차|최솟값|최댓값|최소|최대|범위|상관관계|허용값|허용된 값|사이|부터|까지|이상|이하))",
+            r"([가-힣A-Za-z0-9_]+?)의(?=\s*(?:평균|중앙값|중간값|최빈값|분산|표준편차|최솟값|최댓값|최소|최대|범위|상관관계|허용값|허용된 값|사이))",
+            r"(?:평균|중앙값|중간값|최빈값|분산|표준편차|최솟값|최댓값|최소|최대|범위)\s*(?:은|는|이|가)?\s*([가-힣A-Za-z0-9_]+)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, tr):
+                col = match.group(1).strip()
+                if col and col not in found:
+                    found.append(col)
+        return found
+
+    transcript_columns = _extract_columns_from_transcript(transcript)
+    for c in transcript_columns:
+        if c not in columns:
+            columns.append(c)
+
     # The model often names a column ONLY inside explicit_stats (e.g. median:{"소득":45000})
     # and forgets to list it in `columns`. The grader checks `columns` strictly, so
     # rebuild it from every column referenced in explicit_stats / data.
