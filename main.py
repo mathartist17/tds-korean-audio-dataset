@@ -26,6 +26,18 @@ async def chat(messages, model="gpt-4o", max_tokens=1000):
 
 async def gemini_transcribe(payload, retries=3):
     headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
+
+    def _audio_format(mime):
+        return {
+            "audio/mp3": "mp3",
+            "audio/mpeg": "mp3",
+            "audio/ogg": "ogg",
+            "audio/flac": "flac",
+            "audio/wav": "wav",
+            "audio/webm": "webm",
+            "audio/mp4": "mp4",
+        }.get(mime, "wav")
+
     async with httpx.AsyncClient(timeout=60) as client:
         for model in GEMINI_MODELS:
             request_payload = {
@@ -34,7 +46,7 @@ async def gemini_transcribe(payload, retries=3):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
-                        payload["contents"][0]["parts"][1],
+                        {"type": "input_audio", "input_audio": {"data": payload["contents"][0]["parts"][1]["inlineData"]["data"], "format": _audio_format(payload["contents"][0]["parts"][1]["inlineData"]["mimeType"]) }},
                     ],
                 }],
                 "max_tokens": 1000,
