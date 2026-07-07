@@ -327,6 +327,17 @@ async def answer_audio(request: Request):
         req_stats = ext.get("requested_stats", [])
         num_rows = ext.get("num_rows")
         explicit_stats = ext.get("explicit_stats", {})
+
+        # BUG FIX (q12 leak): the previous guard only filtered column names pulled
+        # from explicit_stats. But the model can ALSO hallucinate directly into the
+        # top-level "columns" array — echoing a word from the prompt's worked
+        # example ("소득", "온도", "키", "몸무게", "점수") instead of the word it
+        # actually saw in the transcript. If there's real DATA (data_rows), the
+        # column name is just a label so we leave it alone — but when there's no
+        # data (columns are the only signal), a column name that never appears in
+        # the transcript is almost certainly a leaked example, not a real answer.
+        if transcript and not data_rows:
+            columns = [c for c in columns if c in transcript]
     except Exception:
         pass
 
