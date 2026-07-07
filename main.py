@@ -395,6 +395,9 @@ async def answer_audio(request: Request):
         if c not in columns:
             columns.append(c)
 
+    if not data_rows and len(transcript_columns) == 1 and not referenced:
+        columns = transcript_columns[:]
+
     if not req_stats:
         req_stats = ["mean", "std", "variance", "min", "max", "median", "mode", "range", "allowed_values", "value_range", "correlation"]
 
