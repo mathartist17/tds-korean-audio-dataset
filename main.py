@@ -1,140 +1,97 @@
-import os
-import re
-import json
-import base64
-import asyncio
-import hashlib
-import copy
-import httpx
-from statistics import mean, pstdev, pvariance, median, mode
+import json, re, base64, hashlib, os
+from statistics import mean, median, pstdev, pvariance, mode
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import httpx
 
 app = FastAPI()
+AIPIPE_BASE="https://aipipe.org/openai/v1"
+TEXT_MODEL = "gpt-4o-mini"
+token = os.environ.get("AIPIPE_TOKEN", "")
+# CORS wide open — grader calls from a Cloudflare Worker
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+    allow_headers=["*"], allow_credentials=False,
+)
+HEAD = {"Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"}
+# --- tiny in-memory cache so repeated grader calls don't cost twice ---
+_CACHE = {}
+def _ck(*parts):
+    return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
+import asyncio
+async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
+    key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
+    if key in _CACHE:
+        return _CACHE[key]
+    body = {"model": model or TEXT_MODEL, "messages": messages,
+            "temperature": 0, "max_tokens": max_tokens}
+    if force_json:
+        body["response_format"] = {"type": "json_object"}
+    last_err = None
+    async with httpx.AsyncClient(timeout=90) as c:
+        for attempt in range(retries):
+            r = await c.post(f"{AIPIPE_BASE}/chat/completions",
+                             headers=HEAD, json=body)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+                await asyncio.sleep(1.5 * (attempt + 1))   # backoff and retry
+                continue
+            r.raise_for_status()
+            out = r.json()["choices"][0]["message"]["content"]
+            _CACHE[key] = out
+            return out
+    raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
+# Gemini models to try in order for audio transcription. If one is overloaded (503)
+# or rate-limited (429), we retry it, then fall through to the next.
+GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash",
+                 "gemini-flash-latest"]
 
-AIPIPE_BASE = os.environ.get("AIPIPE_BASE", "https://aipipe.org/openai/v1")
-AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-TRANSCRIBE_MODELS = ["gpt-audio-1.5", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
-
-
-async def chat(messages, model="gpt-4o", max_tokens=1000):
-    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
-    # temperature=0 makes the extraction step as deterministic as the model allows,
-    # so the same transcript doesn't produce a different JSON structure on every call.
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{AIPIPE_BASE}/chat/completions", headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-
-async def gemini_transcribe(payload, retries=3):
-    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
-
-    def _audio_format(mime):
-        return {
-            "audio/mp3": "mp3",
-            "audio/mpeg": "mp3",
-            "audio/ogg": "ogg",
-            "audio/flac": "flac",
-            "audio/wav": "wav",
-            "audio/webm": "webm",
-            "audio/mp4": "mp4",
-        }.get(mime, "wav")
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        for model in TRANSCRIBE_MODELS:
-            request_payload = {
-                "model": model,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Transcribe this audio precisely in Korean. Output ONLY the Korean transcription, nothing else."},
-                        {"type": "input_audio", "input_audio": {"data": payload["contents"][0]["parts"][1]["inlineData"]["data"], "format": _audio_format(payload["contents"][0]["parts"][1]["inlineData"]["mimeType"]) }},
-                    ],
-                }],
-                "max_tokens": 1000,
-            }
-            for attempt in range(retries):
+async def gemini_transcribe(payload, attempts_per_model=3):
+    global last_debug_info
+    last_err = ""
+    async with httpx.AsyncClient(timeout=120) as c:
+        for model in GEMINI_MODELS:
+            for attempt in range(attempts_per_model):
                 try:
-                    resp = await client.post(f"{AIPIPE_BASE}/chat/completions", headers=headers, json=request_payload)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, dict):
-                            for key in ("output_text", "text", "transcript"):
-                                value = data.get(key)
-                                if isinstance(value, str) and value.strip():
-                                    return value.strip()
-                        choices = data.get("choices", [])
-                        if choices:
-                            message = choices[0].get("message", {})
-                            content = message.get("content", "")
-                            if isinstance(content, str):
-                                return content.strip()
-                            if isinstance(content, list):
-                                parts = []
-                                for part in content:
-                                    if isinstance(part, dict):
-                                        if part.get("text"):
-                                            parts.append(part["text"])
-                                        elif part.get("content"):
-                                            parts.append(str(part["content"]))
-                                    elif isinstance(part, str):
-                                        parts.append(part)
-                                return "".join(parts).strip()
-                            audio = message.get("audio", {}) if isinstance(message, dict) else {}
-                            if isinstance(audio, dict):
-                                for key in ("transcript", "text"):
-                                    value = audio.get(key)
-                                    if isinstance(value, str) and value.strip():
-                                        return value.strip()
-                        if isinstance(data, dict):
-                            for choice in data.get("choices", []):
-                                if isinstance(choice, dict):
-                                    text = choice.get("text")
-                                    if isinstance(text, str) and text.strip():
-                                        return text.strip()
-                        return ""
-                    elif resp.status_code in (429, 503):
-                        await asyncio.sleep(2 ** attempt)
+                    r = await c.post(
+                        f"https://aipipe.org/geminiv1beta/models/{model}:generateContent",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json=payload)
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        last_err = f"HTTP {r.status_code} on {model}: {r.text[:160]}"
+                        await asyncio.sleep(1.5 * (attempt + 1))   # backoff
                         continue
-                    else:
-                        break
-                except Exception:
-                    await asyncio.sleep(2 ** attempt)
+                    r.raise_for_status()
+                    data = r.json()
+                    txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    last_debug_info["transcribe_model"] = model
+                    return txt
+                except (KeyError, IndexError):
+                    last_err = f"empty candidates on {model}"
+                    break   # model answered but no text -> try next model
+                except Exception as e:
+                    last_err = f"{type(e).__name__} on {model}: {str(e)[:160]}"
+                    await asyncio.sleep(1.0 * (attempt + 1))
+    last_debug_info["transcribe_error"] = last_err
     return ""
 
-
-def parse_json(text):
-    text = (text or "").strip()
-    text = re.sub(r"^```json|^```|```$", "", text, flags=re.MULTILINE).strip()
+def parse_json(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
     try:
-        return json.loads(text)
+        return json.loads(s)
     except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                return {}
-        return {}
+        m = re.search(r"\{.*\}", s, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
 
-
-# ================= Q6: /answer-audio =================
 last_debug_info = {}
 last_audio_bytes = b""          # raw audio the grader last sent (for download)
 last_audio_mime = "audio/wav"
 
 audio_history = []      # every Q6 call this session: transcript + extraction + result
-
-# Cache: same audio bytes -> same answer, every time. This is the single biggest
-# fix for "different errors every time": the grader re-sends q0..q3 (or repeats a
-# call to double-check), and the LLM extraction step is not 100% deterministic even
-# at temperature=0. By hashing the raw audio and remembering the first answer we
-# gave for that exact file, every later call with the same audio returns the exact
-# same JSON instead of re-rolling the dice on the LLM.
-answer_cache = {}       # sha256(audio bytes) -> final answer dict
-transcript_cache = {}   # sha256(audio bytes) -> transcript string
 
 @app.get("/debug")
 def get_debug():
@@ -219,14 +176,6 @@ async def answer_audio(request: Request):
         last_audio_bytes = audio          # keep raw bytes for /last-audio download
         last_debug_info["magic_bytes"] = audio[:16].hex()   # first bytes -> real format
 
-        # --- Cache check: if we've already answered for this EXACT audio, return the
-        # exact same JSON instead of re-transcribing / re-extracting (which can vary). ---
-        audio_hash = hashlib.sha256(audio).hexdigest()
-        last_debug_info["audio_hash"] = audio_hash
-        if audio_hash in answer_cache:
-            last_debug_info["cache_hit"] = True
-            return copy.deepcopy(answer_cache[audio_hash])
-
         # Detect audio format from magic bytes and use the CORRECT mime type.
         # (Hardcoding audio/mp3 breaks students whose seeded audio is WAV/OGG/FLAC.)
         if audio.startswith(b"ID3") or audio[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
@@ -261,7 +210,7 @@ async def answer_audio(request: Request):
     except Exception as e:
         transcript = ""
         last_debug_info["exception"] = str(e)
-
+    
     last_debug_info["transcript"] = transcript
 
     # Step 1: LLM extracts structured data AND identifies requested statistics
@@ -327,17 +276,6 @@ async def answer_audio(request: Request):
         req_stats = ext.get("requested_stats", [])
         num_rows = ext.get("num_rows")
         explicit_stats = ext.get("explicit_stats", {})
-
-        # BUG FIX (q12 leak): the previous guard only filtered column names pulled
-        # from explicit_stats. But the model can ALSO hallucinate directly into the
-        # top-level "columns" array — echoing a word from the prompt's worked
-        # example ("소득", "온도", "키", "몸무게", "점수") instead of the word it
-        # actually saw in the transcript. If there's real DATA (data_rows), the
-        # column name is just a label so we leave it alone — but when there's no
-        # data (columns are the only signal), a column name that never appears in
-        # the transcript is almost certainly a leaked example, not a real answer.
-        if transcript and not data_rows:
-            columns = [c for c in columns if c in transcript]
     except Exception:
         pass
 
@@ -373,87 +311,18 @@ async def answer_audio(request: Request):
                  "range", "allowed_values", "value_range", "correlation"]):
             req_stats.append("allowed_values")
 
-    def _extract_columns_from_transcript(tr):
-        found = []
-        if not tr:
-            return found
-
-        stat_words = (
-            "평균", "중앙값", "중간값", "최빈값", "분산", "표준편차", "최솟값", "최댓값",
-            "최소", "최대", "범위", "상관관계", "허용값", "허용된 값", "사이", "부터",
-            "까지", "이상", "이하",
-        )
-        patterns = [
-            rf"([가-힣A-Za-z0-9_]+?)\s*(?:의\s*)?(?:{'|'.join(stat_words)})",
-            rf"([가-힣A-Za-z0-9_]+?)(?:는|은|이|가)(?=\s*(?:{'|'.join(stat_words)}))",
-            rf"(?:{'|'.join(stat_words)})\s*(?:은|는|이|가)?\s*([가-힣A-Za-z0-9_]+)",
-        ]
-        for pattern in patterns:
-            for match in re.finditer(pattern, tr):
-                col = match.group(1).strip()
-                if col and col not in found:
-                    found.append(col)
-
-        if not found:
-            tokens = re.findall(r"[가-힣A-Za-z0-9_]+", tr)
-            stopwords = set(stat_words) | {
-                "데이터", "자료", "표", "행", "열", "값", "구하라", "구하세요", "계산", "출력",
-                "다음", "문항", "문제", "모두", "각각", "사람", "학생", "점수", "소득",
-                "몸무게", "키", "나이",
-            }
-            candidates = []
-            for token in tokens:
-                if len(token) > 1 and not token.isdigit() and token not in stopwords and token not in candidates:
-                    candidates.append(token)
-            if len(candidates) == 1:
-                found.append(candidates[0])
-        return found
-
-    transcript_columns = _extract_columns_from_transcript(transcript)
-    for c in transcript_columns:
-        if c not in columns:
-            columns.append(c)
-
     # The model often names a column ONLY inside explicit_stats (e.g. median:{"소득":45000})
     # and forgets to list it in `columns`. The grader checks `columns` strictly, so
     # rebuild it from every column referenced in explicit_stats / data.
-    #
-    # BUG FIX: the prompt above contains WORKED EXAMPLES with realistic-looking Korean
-    # column names ("소득", "온도", "키", "몸무게", "점수"). When the transcript is short,
-    # noisy, or mistranscribed, the model sometimes echoes one of these EXAMPLE words
-    # back as if it were real data instead of the actual word it heard (e.g. it returns
-    # "소득" when the audio actually said "길이"). That's exactly the q12 failure:
-    # expected "길이", got "소득" — a hallucinated example leaking into the answer.
-    #
-    # Fix: only trust a column name pulled from explicit_stats if that name literally
-    # appears in the transcript text. If it doesn't, treat it as a hallucination and
-    # drop it (and its stat entry) rather than shipping a wrong/nondeterministic value.
-    def _in_transcript(name):
-        return bool(name) and bool(transcript) and name in transcript
-
     referenced = []
     for sd in (explicit_stats or {}).values():
         if isinstance(sd, dict):
-            for k in list(sd.keys()):
+            for k in sd:
                 if k not in referenced:
                     referenced.append(k)
-
     for c in referenced:
-        if c in columns:
-            continue
-        if _in_transcript(c) or not transcript:
-            # Trust it if it's actually in the transcript, or if we have no
-            # transcript at all to check against (nothing better to go on).
+        if c not in columns:
             columns.append(c)
-        else:
-            # Hallucinated column name (e.g. a leaked prompt example) — strip it
-            # out of every explicit_stats dict so it can't pollute the answer.
-            for sd in explicit_stats.values():
-                if isinstance(sd, dict) and c in sd:
-                    del sd[c]
-
-    if not data_rows and len(transcript_columns) == 1 and not referenced:
-        columns = transcript_columns[:]
 
     if not req_stats:
         req_stats = ["mean", "std", "variance", "min", "max", "median", "mode", "range", "allowed_values", "value_range", "correlation"]
@@ -479,7 +348,7 @@ async def answer_audio(request: Request):
         if not v:
             continue
         cols_vals.append(v)
-
+        
         if "mean" in req_stats: out["mean"][name] = mean(v)
         if "std" in req_stats: out["std"][name] = pstdev(v) if len(v) > 1 else 0.0
         if "variance" in req_stats: out["variance"][name] = pvariance(v) if len(v) > 1 else 0.0
@@ -528,16 +397,9 @@ async def answer_audio(request: Request):
                     num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
                     corr_list.append({"x": columns[i], "y": columns[j],
                                       "type": "negative" if num < 0 else "positive"})
-    # Same hallucination guard for correlation pairs: only keep a {x,y,type} entry
-    # if both column names are actually traceable to this transcript (either heard
-    # directly, or already accepted into `columns` above).
-    if corr_list:
-        corr_list = [c for c in corr_list
-                     if (c["x"] in columns or _in_transcript(c["x"]))
-                     and (c["y"] in columns or _in_transcript(c["y"]))]
     if corr_list:
         out["correlation"] = corr_list
-
+        
     # ---- Decide the EXACT set of stats the grader wants (the whole ballgame) ----
     # The model sets requested_stats to the FULL list as its "nothing specific was
     # asked, only a constraint was stated" signal. In that case the grader wants
@@ -609,9 +471,4 @@ async def answer_audio(request: Request):
     })
     if len(audio_history) > 50:
         del audio_history[0]
-
-    # Remember this exact answer for this exact audio so any repeat call (retries,
-    # double-checks, re-grading) gets byte-for-byte the same JSON, forever.
-    answer_cache[audio_hash] = copy.deepcopy(out)
-
     return out
