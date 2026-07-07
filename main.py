@@ -11,7 +11,7 @@ app = FastAPI()
 
 AIPIPE_BASE = os.environ.get("AIPIPE_BASE", "https://aipipe.org/openai/v1")
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+TRANSCRIBE_MODELS = ["gpt-audio-1.5", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
 
 
 async def chat(messages, model="gpt-4o", max_tokens=1000):
@@ -39,7 +39,7 @@ async def gemini_transcribe(payload, retries=3):
         }.get(mime, "wav")
 
     async with httpx.AsyncClient(timeout=60) as client:
-        for model in GEMINI_MODELS:
+        for model in TRANSCRIBE_MODELS:
             request_payload = {
                 "model": model,
                 "messages": [{
@@ -56,6 +56,11 @@ async def gemini_transcribe(payload, retries=3):
                     resp = await client.post(f"{AIPIPE_BASE}/chat/completions", headers=headers, json=request_payload)
                     if resp.status_code == 200:
                         data = resp.json()
+                        if isinstance(data, dict):
+                            for key in ("output_text", "text", "transcript"):
+                                value = data.get(key)
+                                if isinstance(value, str) and value.strip():
+                                    return value.strip()
                         choices = data.get("choices", [])
                         if choices:
                             message = choices[0].get("message", {})
@@ -65,9 +70,26 @@ async def gemini_transcribe(payload, retries=3):
                             if isinstance(content, list):
                                 parts = []
                                 for part in content:
-                                    if isinstance(part, dict) and part.get("text"):
-                                        parts.append(part["text"])
+                                    if isinstance(part, dict):
+                                        if part.get("text"):
+                                            parts.append(part["text"])
+                                        elif part.get("content"):
+                                            parts.append(str(part["content"]))
+                                    elif isinstance(part, str):
+                                        parts.append(part)
                                 return "".join(parts).strip()
+                            audio = message.get("audio", {}) if isinstance(message, dict) else {}
+                            if isinstance(audio, dict):
+                                for key in ("transcript", "text"):
+                                    value = audio.get(key)
+                                    if isinstance(value, str) and value.strip():
+                                        return value.strip()
+                        if isinstance(data, dict):
+                            for choice in data.get("choices", []):
+                                if isinstance(choice, dict):
+                                    text = choice.get("text")
+                                    if isinstance(text, str) and text.strip():
+                                        return text.strip()
                         return ""
                     elif resp.status_code in (429, 503):
                         await asyncio.sleep(2 ** attempt)
